@@ -1,0 +1,167 @@
+# Starter pipeline
+# Start with a minimal pipeline that you can customize to build and deploy your code.
+# Add steps that build, run tests, deploy, and more:
+# https://aka.ms/yaml
+
+trigger:
+- main
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  - group: SAP CF SK variables
+
+
+resources:
+  containers:
+    - container: mta
+      image: ghcr.io/sap/mbtci-java11-node14:latest
+      options: --user 0:0
+    - container: cfcli
+      image: ppiper/cf-cli
+      options: --user 0:0 --privileged
+    - container: node
+      image: geekykaran/headless-chrome-node-docker:latest
+      options: --privileged
+
+stages: 
+  - stage: build
+    displayName: Build MTA
+    jobs:
+      - job: build
+        container: mta
+        steps:
+          - checkout: self
+
+          - bash: |
+              echo "Usuario CF es: $CF_USER"
+              echo "=== DEBUG: START ==="
+              echo "Working directory: $(Build.SourcesDirectory)"
+              echo "Staging directory: $(Build.ArtifactStagingDirectory)"
+              ls -la
+
+              echo "=== Building MTA ==="
+              mbt --platform cf --mtar MySampleApp.mtar -t $(Build.SourcesDirectory) build
+
+              echo "=== DEBUG: POST BUILD ==="
+              ls -la $(Build.SourcesDirectory)
+
+              cd app
+              npm install
+              cd ..
+
+              if [ -f "$(Build.SourcesDirectory)/MySampleApp.mtar" ]; then
+                echo "##vso[task.setvariable variable=Build.MtarExists]true"
+              else
+                echo "##vso[task.logissue type=error]MTAR file not found in staging directory!"
+                ls -R $(Build.SourcesDirectory)
+              fi
+            workingDirectory: $(Build.SourcesDirectory)
+          - task: PublishPipelineArtifact@1
+            inputs:
+              targetPath: $(Build.SourcesDirectory)/MySampleApp.mtar
+              artifact: 'WebApp'
+            condition: and(succeeded(), eq(variables['Build.MtarExists'], 'true'))
+            displayName: 'Publish MTAR Artifact'
+
+  - stage: deploy
+    displayName: Deploy to CF
+    dependsOn: build
+    jobs:
+      - job: deploy
+        container: cfcli
+        timeoutInMinutes: 5  # Job-level timeout
+        steps:
+          - task: DownloadPipelineArtifact@2
+            inputs:
+              artifact: 'WebApp'
+              path: '$(Pipeline.Workspace)/WebApp'
+          - bash: |
+              echo "Starting deployment (timeout: 5 minutes)"
+              echo "Pipeline.Workspace = $(Pipeline.Workspace)"
+              echo "Contenido de Pipeline.Workspace:"
+              ls -R $(Pipeline.Workspace)
+              cf login -u \"$(CF_USER)\" -p "$(CF_PASSWORD)" -a \"$(CF_API)\" -o \"$(CF_ORG)\" -s \"$(CF_SPACE)\" && \
+              cf deploy "/__w/1/WebApp/MySampleApp.mtar" -f \
+              
+              echo "complete"
+              #" || echo "##vso[task.complete result=Succeeded]Deployment timed out after 5 minutes"
+            displayName: 'Deploy with timeout'
+            continueOnError: false  # Ensures pipeline continues even if timeout occurs
+
+  - stage: upload
+    displayName: Upload to CTMS
+    jobs:
+      - job: upload
+        pool:
+          vmImage: 'ubuntu-latest'
+        container: cfcli
+        steps:
+          - download: current
+            artifact: WebApp
+          - bash: | 
+              - bash: |
+                  echo "Obtaining token..."
+                  TOKEN_RESPONSE=$(curl -s -X POST -u "$(CF_CLIENTID):$(CF_CLIENTSECRET" \
+                    -d "grant_type=client_credentials&response_type=token" \
+                    $(CF_URL)/oauth/token)
+
+                  echo "Token response:"
+                  echo "$TOKEN_RESPONSE"
+
+                  TOKEN=$(echo "$TOKEN_RESPONSE" | sed -n 's/.*"access_token":"\([^"]*\)".*/\1/p')
+
+                  if [ -z "$TOKEN" ]; then
+                    echo "Can't obtain access token"
+                    exit 1
+                  fi
+
+                  echo "Uploading .mtar file..."
+                  UPLOAD_RESPONSE=$(curl -s --location --request POST \
+                    '$(CF_URI)/v2/files/upload' \
+                    --header "Authorization: Bearer $TOKEN" \
+                    --form "file=@\"$(Pipeline.Workspace)/WebApp/MySampleApp.mtar\"")
+
+                  echo "Upload response:"
+                  echo "$UPLOAD_RESPONSE"
+
+                  FILE_ID=$(echo "$UPLOAD_RESPONSE" | grep -oE '"fileId":[0-9]+' | grep -oE '[0-9]+')
+
+                  if [ -z "$FILE_ID" ]; then
+                    echo "Can't onbtaing file"
+                    exit 1
+                  fi
+
+          
+
+                  PAYLOAD=$(cat <<EOF
+              {
+                "nodeName": "dev",
+                "contentType": "MTA",
+                "storageType": "FILE",
+                "entries": [
+                  {
+                    "uri": "$FILE_ID"
+                  }
+                ],
+                "description": "Upload dev",
+                "namedUser": "name"
+              }
+              EOF
+              )
+
+                  echo "Payload final:"
+                  echo "$PAYLOAD"
+
+                  NODE_UPLOAD_RESPONSE=$(curl -s --location --request POST \
+                    '$(CF_URI)/v2/nodes/upload' \
+                    --header 'Content-Type: application/json' \
+                    --header "Authorization: Bearer $TOKEN" \
+                    --data-raw "$PAYLOAD")
+
+                  echo "Nodo response:"
+                  echo "$NODE_UPLOAD_RESPONSE"
+
+
+

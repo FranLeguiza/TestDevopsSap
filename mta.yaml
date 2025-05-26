@@ -1,0 +1,10 @@
+ID: test-app
+_schema-version: '3.2'
+version: 1.0.0
+
+modules:
+  - name: test-ui
+    type: nodejs
+    path: app/
+    parameters:
+      memory: 128M
